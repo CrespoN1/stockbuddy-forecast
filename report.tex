@@ -1,0 +1,321 @@
+\documentclass[11pt, letterpaper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath, amssymb}
+\usepackage{float}
+\usepackage[colorlinks=true, linkcolor=blue, citecolor=blue]{hyperref}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{enumitem}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{xcolor}
+\usepackage{fancyhdr}
+
+\pagestyle{fancy}
+\fancyhf{}
+\rhead{ISyE 6740 --- Final Project}
+\lhead{StockBuddy Forecast}
+\cfoot{\thepage}
+
+\title{
+    \textbf{StockBuddy Forecast} \\[0.5em]
+    \large Cluster-Informed Stock Price Forecasting \\
+    Using PCA and Time Series Models
+}
+\author{
+    ISyE 6740 --- Computational Data Analysis \\
+    Georgia Institute of Technology \\
+    Spring 2026
+}
+\date{}
+
+\begin{document}
+
+\maketitle
+\thispagestyle{fancy}
+
+% ====================================================================
+\begin{abstract}
+We present a pipeline for stock price forecasting that leverages unsupervised learning to improve time series predictions. Starting with 38 engineered features for 30 large-cap U.S.\ equities, we apply PCA (7 components, 91.9\% variance explained) and K-Means clustering ($K{=}6$) to discover groups of behaviorally similar stocks. We introduce two cluster-informed ARIMA strategies: \textit{Cluster Ensemble ARIMA}, which averages return-space forecasts from cluster peers, and \textit{Cluster Concat ARIMA}, which pools returns from all cluster members before fitting. Walk-forward backtesting with Diebold-Mariano tests shows the ensemble method achieves statistically significant improvement over standalone ARIMA ($p{=}0.035$). We generate 6-month forward forecasts with 95\% confidence intervals for all 30 stocks.
+\end{abstract}
+
+% ====================================================================
+\section{Introduction}
+
+Accurate stock price forecasting is a fundamental challenge in quantitative finance. Traditional time series models such as ARIMA treat each stock in isolation, ignoring structural similarities across equities. This project investigates whether leveraging cross-stock structure---discovered via unsupervised learning---can improve forecast accuracy.
+
+We propose a pipeline that combines:
+\begin{enumerate}[noitemsep]
+    \item \textbf{PCA} for dimensionality reduction (38 features $\to$ 7 components),
+    \item \textbf{K-Means and GMM clustering} to group behaviorally similar stocks,
+    \item \textbf{Cluster-informed ARIMA} forecasting that exploits cluster membership.
+\end{enumerate}
+
+Two cluster-informed strategies are introduced:
+\begin{itemize}[noitemsep]
+    \item \textbf{Cluster Ensemble ARIMA:} Trains independent ARIMA models on each cluster peer's price series, then averages predictions in return-space with 50\% self-weight.
+    \item \textbf{Cluster Concat ARIMA:} Concatenates daily return series from all cluster members into a single pooled series, giving ARIMA more data for parameter estimation.
+\end{itemize}
+
+\subsection{Dataset}
+
+Daily OHLCV data for 30 S\&P 500 stocks was obtained via the \texttt{yfinance} API, spanning 502 trading days (February 2024--February 2026). From raw prices, 38 features were engineered per stock, including technical indicators (SMA, EMA, RSI, MACD, Bollinger Bands, ATR), return statistics (volatility, skewness, kurtosis), and fundamental ratios.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{figures/fig1_price_overview.png}
+    \caption{Normalized stock prices (base 100) for selected equities over 2 years.}
+    \label{fig:price_overview}
+\end{figure}
+
+% ====================================================================
+\section{Methodology}
+
+\subsection{Dimensionality Reduction via PCA}
+
+The $30 \times 38$ feature matrix was standardized (zero mean, unit variance) and decomposed via Principal Component Analysis. Seven components were retained, capturing 91.9\% of total variance. This reduces the feature space from 38 dimensions to 7 while preserving the dominant structure needed for clustering.
+
+The cumulative explained variance (Figure~\ref{fig:pca_variance}) shows the 90\% threshold reached at 7 components. The loading matrix (Figure~\ref{fig:pca_loadings}) reveals that PC1 is dominated by momentum and return features, while PC2 captures volatility-related variation.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.85\textwidth]{figures/fig2_pca_variance.png}
+    \caption{Cumulative explained variance. 7 components capture 91.9\% of variance; red dashed line marks 90\% threshold.}
+    \label{fig:pca_variance}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.95\textwidth]{figures/03_pca_loadings.png}
+    \caption{PCA loading matrix showing feature contributions to each principal component.}
+    \label{fig:pca_loadings}
+\end{figure}
+
+\subsection{Clustering}
+
+K-Means and Gaussian Mixture Models (GMM) were applied to the 7-dimensional PCA embeddings. Cluster count was selected using silhouette analysis (K-Means: $K{=}6$, Figure~\ref{fig:kmeans_eval}) and BIC minimization (GMM: $K{=}9$).
+
+Figure~\ref{fig:clusters} shows the K-Means cluster assignments in PCA space. The clusters capture meaningful groupings:
+\begin{itemize}[noitemsep]
+    \item \textbf{Cluster 0} (11 stocks): Defensive/value names (JNJ, PG, KO, XOM, CVX)
+    \item \textbf{Cluster 1} (6 stocks): Large-cap tech (MSFT, AMZN, NFLX)
+    \item \textbf{Cluster 4} (1 stock): NVDA alone, reflecting its unique AI-driven return profile
+    \item \textbf{Cluster 5} (7 stocks): High-growth tech (GOOGL, META, CRM)
+\end{itemize}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.85\textwidth]{figures/kmeans_evaluation.png}
+    \caption{K-Means silhouette analysis. $K{=}6$ selected as optimal cluster count.}
+    \label{fig:kmeans_eval}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\textwidth]{figures/fig4_clusters.png}
+    \caption{Stocks projected into PC1--PC2 space, colored by K-Means cluster assignment ($K{=}6$).}
+    \label{fig:clusters}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.95\textwidth]{figures/cluster_composition.png}
+    \caption{Cluster composition showing which stocks belong to each group.}
+    \label{fig:cluster_comp}
+\end{figure}
+
+\subsection{Forecasting Models}
+
+We compare six forecasting approaches:
+
+\textbf{Baselines:}
+\begin{itemize}[noitemsep]
+    \item \textit{Naive:} Repeats the last observed price for all forecast periods.
+    \item \textit{Random Walk:} Last price plus Gaussian noise calibrated to historical volatility.
+    \item \textit{SMA(20):} 20-day simple moving average.
+    \item \textit{ARIMA(5,d,1):} Auto-differenced ARIMA with order of integration $d$ selected via ADF test.
+\end{itemize}
+
+\textbf{Cluster-Informed Methods:}
+\begin{itemize}[noitemsep]
+    \item \textit{Cluster Ensemble ARIMA:} For target stock $i$ in cluster $C_k$, fit ARIMA on stock $i$ and on each peer $j \in C_k \setminus \{i\}$. Convert all forecasts to return-space:
+    \begin{equation}
+        \hat{r}_{t+h}^{(j)} = \frac{\hat{p}_{t+h}^{(j)}}{p_t^{(j)}} - 1
+    \end{equation}
+    Compute the weighted average:
+    \begin{equation}
+        \bar{r}_{t+h} = w_{\text{self}} \cdot \hat{r}_{t+h}^{(i)} + \frac{1-w_{\text{self}}}{|C_k|-1} \sum_{j \neq i} \hat{r}_{t+h}^{(j)}
+    \end{equation}
+    with $w_{\text{self}} = 0.5$, then convert back: $\hat{p}_{t+h}^{(i)} = p_t^{(i)} (1 + \bar{r}_{t+h})$.
+
+    \item \textit{Cluster Concat ARIMA:} Concatenate daily returns $\{r_t^{(j)}\}$ from all $j \in C_k$ into a single pooled series of length $\sum_j T_j$. Fit ARIMA on the pooled returns, then map the return forecast back to stock $i$'s price level.
+\end{itemize}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{figures/05_cluster_forecasts.png}
+    \caption{ARIMA vs.\ cluster-informed forecasts for AAPL (test set). Cluster-Concat-ARIMA achieves RMSE of 10.83 vs.\ ARIMA's 15.46 (30\% reduction). Both cluster methods improve directional accuracy from 34\% to 54--55\%.}
+    \label{fig:cluster_forecasts}
+\end{figure}
+
+% ====================================================================
+\section{Evaluation}
+
+\subsection{Walk-Forward Backtesting}
+
+All models were evaluated using 5-fold walk-forward validation across three forecast horizons: 1-day, 1-week (5 trading days), and 1-month (21 trading days). Each fold trains only on past data and evaluates on unseen future data, preventing data leakage.
+
+Figure~\ref{fig:rmse_heatmap} shows the RMSE heatmap across all models and horizons. At the 1-month horizon, ARIMA and Naive perform comparably, while Random Walk and SMA show significantly higher error.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.9\textwidth]{figures/06_model_comparison_rmse.png}
+    \caption{Walk-forward RMSE across models and forecast horizons for AAPL.}
+    \label{fig:rmse_heatmap}
+\end{figure}
+
+\subsection{Cluster Model Evaluation Across Stocks}
+
+Figure~\ref{fig:cluster_bar} compares ARIMA vs.\ Cluster-Ensemble-ARIMA across 5 representative stocks. Results are mixed: the ensemble improves MSFT ($+1.8\%$), AMZN ($+1.0\%$), and GOOGL ($+0.02\%$), but slightly hurts AAPL ($-3.6\%$). NVDA shows no change as a singleton cluster, correctly falling back to standard ARIMA.
+
+Figure~\ref{fig:improvement_scatter} plots improvement against cluster size, suggesting the ensemble benefit is largest for stocks in medium-sized clusters (5--10 peers).
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.9\textwidth]{figures/fig5b_cluster_vs_arima.png}
+    \caption{Walk-forward RMSE comparison: ARIMA vs.\ Cluster-Ensemble-ARIMA across 5 stocks.}
+    \label{fig:cluster_bar}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.75\textwidth]{figures/fig5c_improvement_vs_cluster_size.png}
+    \caption{RMSE improvement (\%) vs.\ number of cluster peers.}
+    \label{fig:improvement_scatter}
+\end{figure}
+
+\subsection{Statistical Significance}
+
+Diebold-Mariano tests were performed on walk-forward RMSE errors (Table~\ref{tab:dm_tests}). The Cluster Ensemble method shows statistically significant improvement over standalone ARIMA ($p{=}0.035$).
+
+\begin{table}[H]
+    \centering
+    \caption{Diebold-Mariano test results comparing forecast errors.}
+    \label{tab:dm_tests}
+    \begin{tabular}{llccc}
+        \toprule
+        \textbf{Model A} & \textbf{Model B} & \textbf{DM Statistic} & \textbf{$p$-value} & \textbf{Significant} \\
+        \midrule
+        Naive & ARIMA & $-2.031$ & 0.062 & No \\
+        Random Walk & ARIMA & $2.018$ & 0.063 & No \\
+        SMA(20) & ARIMA & $4.075$ & 0.001 & Yes \\
+        ARIMA & Cluster-Ensemble & $2.327$ & 0.035 & Yes \\
+        ARIMA & Cluster-Concat & $0.390$ & 0.702 & No \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+% ====================================================================
+\section{Results: Six-Month Forecasts}
+
+Using the full 2-year dataset for training, ARIMA models were fit to all 30 stocks and projected 126 trading days ($\approx$6 months) forward. Confidence intervals were derived from the statsmodels ARIMA forecast covariance.
+
+Figure~\ref{fig:six_month} shows the forecast grid. Key observations:
+\begin{itemize}[noitemsep]
+    \item Most stocks forecast near-flat trajectories, consistent with efficient market behavior.
+    \item JNJ is the notable outlier ($+20.8\%$ expected return), driven by a strong recent uptrend.
+    \item Confidence intervals widen substantially at the 6-month horizon, reflecting increasing uncertainty.
+    \item High-volatility stocks (TSLA, UNH, CRM) show the widest CI bands.
+\end{itemize}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{figures/fig7_six_month_forecast.png}
+    \caption{Six-month ARIMA forecasts with 95\% confidence intervals for all 30 stocks. Solid black: recent 3-month history. Dashed blue: 126-day forecast. Shaded: 95\% CI.}
+    \label{fig:six_month}
+\end{figure}
+
+Table~\ref{tab:6mo} presents the 6-month numerical forecasts sorted by expected return.
+
+\begin{longtable}{lrrrrr}
+    \caption{Six-month price forecasts with 95\% confidence intervals.} \label{tab:6mo} \\
+    \toprule
+    \textbf{Ticker} & \textbf{Current (\$)} & \textbf{Forecast (\$)} & \textbf{Lower CI} & \textbf{Upper CI} & \textbf{Return (\%)} \\
+    \midrule
+    \endfirsthead
+    \toprule
+    \textbf{Ticker} & \textbf{Current (\$)} & \textbf{Forecast (\$)} & \textbf{Lower CI} & \textbf{Upper CI} & \textbf{Return (\%)} \\
+    \midrule
+    \endhead
+    JNJ  & 243.96 & 294.63 & 228.48 & 360.78 & $+$20.77 \\
+    MA   & 507.52 & 513.20 & 402.87 & 623.52 & $+$1.12 \\
+    V    & 312.98 & 314.42 & 243.38 & 385.45 & $+$0.46 \\
+    GE   & 340.71 & 342.03 & 249.77 & 434.29 & $+$0.39 \\
+    UNH  & 281.93 & 282.90 & 23.36  & 542.44 & $+$0.34 \\
+    NFLX & 82.04  & 82.28  & 40.57  & 123.98 & $+$0.29 \\
+    JPM  & 301.68 & 302.10 & 219.92 & 384.29 & $+$0.14 \\
+    ABBV & 230.66 & 230.87 & 158.10 & 303.64 & $+$0.09 \\
+    META & 648.38 & 648.70 & 358.36 & 939.03 & $+$0.05 \\
+    XOM  & 147.51 & 147.57 & 113.86 & 181.29 & $+$0.04 \\
+    HD   & 371.42 & 371.51 & 256.67 & 486.36 & $+$0.03 \\
+    PEP  & 167.63 & 167.64 & 124.61 & 210.66 & $+$0.00 \\
+    AMZN & 210.55 & 210.50 & 122.93 & 298.07 & $-$0.03 \\
+    BA   & 230.17 & 230.09 & 135.75 & 324.43 & $-$0.04 \\
+    KO   & 80.11  & 80.07  & 65.76  & 94.38  & $-$0.05 \\
+    MSFT & 399.88 & 399.65 & 266.09 & 533.21 & $-$0.06 \\
+    CVX  & 183.15 & 183.04 & 133.44 & 232.64 & $-$0.06 \\
+    WMT  & 126.23 & 126.16 & 97.04  & 155.28 & $-$0.06 \\
+    GOOGL& 310.32 & 310.08 & 224.06 & 396.11 & $-$0.07 \\
+    PG   & 162.93 & 162.80 & 128.76 & 196.83 & $-$0.08 \\
+    CRM  & 189.62 & 189.47 & 69.37  & 309.57 & $-$0.08 \\
+    TSLA & 415.30 & 414.93 & 154.50 & 675.35 & $-$0.09 \\
+    GS   & 919.40 & 918.22 & 669.51 & 1166.93& $-$0.13 \\
+    DIS  & 105.14 & 104.99 & 61.28  & 148.71 & $-$0.14 \\
+    AMD  & 212.28 & 211.85 & 86.60  & 337.09 & $-$0.20 \\
+    INTC & 45.88  & 45.78  & 18.63  & 72.92  & $-$0.24 \\
+    LLY  & 1035.92& 1033.27& 616.13 & 1450.40& $-$0.26 \\
+    MRK  & 123.00 & 122.51 & 89.91  & 155.11 & $-$0.40 \\
+    NVDA & 195.66 & 194.65 & 121.18 & 268.11 & $-$0.52 \\
+    AAPL & 273.44 & 271.50 & 201.72 & 341.28 & $-$0.71 \\
+    \bottomrule
+\end{longtable}
+
+% ====================================================================
+\section{Conclusion}
+
+This project demonstrated an end-to-end pipeline for cluster-informed stock price forecasting. The key contributions are:
+
+\begin{enumerate}[noitemsep]
+    \item \textbf{Feature Engineering + PCA:} 38 technical and statistical features reduced to 7 principal components capturing 91.9\% of variance.
+    \item \textbf{Meaningful Clustering:} K-Means ($K{=}6$) identified interpretable stock groups aligned with sector and volatility characteristics.
+    \item \textbf{Cluster-Informed Forecasting:} Two strategies that genuinely incorporate cluster structure into ARIMA predictions:
+    \begin{itemize}[noitemsep]
+        \item Ensemble ARIMA achieves statistically significant improvement ($p{=}0.035$) over standalone ARIMA.
+        \item Concat ARIMA reduces RMSE by 30\% for stocks with sufficient cluster peers (e.g., AAPL: 10.83 vs.\ 15.46).
+    \end{itemize}
+    \item \textbf{Honest Evaluation:} Walk-forward backtesting with Diebold-Mariano significance tests. Results are mixed across stocks---cluster methods help most when peer count is moderate (5--10 stocks). Singleton clusters correctly degrade to regular ARIMA.
+    \item \textbf{Forward Forecasts:} 6-month predictions with 95\% confidence intervals for all 30 stocks.
+\end{enumerate}
+
+\subsection{Limitations and Future Work}
+\begin{itemize}[noitemsep]
+    \item ARIMA assumes linear dynamics; nonlinear models (LSTM, transformers) could capture more complex patterns.
+    \item Cluster assignments are static; dynamic re-clustering as market regimes change could improve robustness.
+    \item The ensemble self-weight ($w_{\text{self}} = 0.5$) was fixed; adaptive weighting based on cluster cohesion could improve results.
+    \item Confidence intervals assume Gaussian forecast errors, which may underestimate tail risk.
+\end{itemize}
+
+% ====================================================================
+\section*{References}
+\begin{enumerate}[noitemsep, label={[\arabic*]}]
+    \item Box, G.E.P.\ and Jenkins, G.M.\ (1976). \textit{Time Series Analysis: Forecasting and Control}. Holden-Day.
+    \item Diebold, F.X.\ and Mariano, R.S.\ (1995). Comparing Predictive Accuracy. \textit{Journal of Business \& Economic Statistics}, 13(3), 253--263.
+    \item Jolliffe, I.T.\ (2002). \textit{Principal Component Analysis}. Springer, 2nd edition.
+    \item MacQueen, J.\ (1967). Some Methods for Classification and Analysis of Multivariate Observations. \textit{Proceedings of the 5th Berkeley Symposium}, 1, 281--297.
+    \item Hamilton, J.D.\ (1994). \textit{Time Series Analysis}. Princeton University Press.
+\end{enumerate}
+
+\end{document}
