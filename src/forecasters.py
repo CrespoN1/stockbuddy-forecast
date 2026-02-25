@@ -179,111 +179,220 @@ class LSTMForecaster:
 
 
 # =============================================================================
-# Cluster-Informed Forecaster
+# Cluster-Informed Forecasters
 # =============================================================================
 
-class ClusterInformedForecaster:
+class ClusterEnsembleARIMA:
     """
-    Train separate forecasting models for each cluster of stocks.
+    Cluster Ensemble ARIMA: trains ARIMA on each cluster peer's price
+    series, then averages predictions in return-space.
 
-    The idea: stocks that behave similarly (same cluster) can share
-    training data, improving model generalization.
+    Stocks in the same cluster share similar behavior (identified via
+    PCA + K-Means). By ensembling forecasts from peer stocks, the model
+    leverages cross-stock signal as regularization against overfitting.
     """
 
-    def __init__(
-        self,
-        model_type: str = "arima",
-        lstm_params: Optional[Dict] = None,
-    ):
+    def __init__(self, self_weight: float = 0.5):
         """
         Args:
-            model_type: "arima" or "lstm"
-            lstm_params: Optional LSTM hyperparameters
+            self_weight: Weight for the target stock's own ARIMA model.
+                         Remaining (1 - self_weight) is split among peers.
         """
-        self.model_type = model_type
-        self.lstm_params = lstm_params or {}
-        self.cluster_models: Dict[int, object] = {}
-        self.name = f"Cluster-{model_type.upper()}"
+        self.self_weight = self_weight
+        self.target_model = None
+        self.peer_models: Dict[str, object] = {}
+        self.last_price = None
+        self.name = "Cluster-Ensemble-ARIMA"
 
-    def fit(
-        self,
-        stock_data: Dict[str, pd.DataFrame],
-        cluster_labels: pd.Series,
-    ):
+    def fit(self, series: pd.Series, peer_series: Optional[Dict[str, pd.Series]] = None):
         """
-        Train one model per cluster using pooled data from all stocks
-        in that cluster.
+        Fit ARIMA on target stock and all cluster peers.
 
         Args:
-            stock_data: Dict mapping ticker -> OHLCV DataFrame
-            cluster_labels: Series mapping ticker -> cluster label
+            series: Target stock's Close price series
+            peer_series: Dict of ticker -> Close price series for cluster peers
         """
-        clusters = cluster_labels.unique()
+        self.last_price = series.iloc[-1]
 
-        for cluster_id in clusters:
-            # Get tickers in this cluster
-            tickers = cluster_labels[cluster_labels == cluster_id].index.tolist()
+        # Fit on target stock
+        self.target_model = ARIMAForecast()
+        self.target_model.fit(series)
 
-            # Pool training data from all stocks in cluster
-            pooled_returns = []
-            for ticker in tickers:
-                if ticker in stock_data:
-                    returns = stock_data[ticker]["Close"].pct_change().dropna()
-                    pooled_returns.append(returns)
-
-            if not pooled_returns:
-                continue
-
-            # Concatenate returns (use the longest series for the model)
-            # For ARIMA: train on the first stock's data (representative)
-            representative_ticker = tickers[0]
-            if representative_ticker in stock_data:
-                train_series = stock_data[representative_ticker]["Close"]
-
-                if self.model_type == "arima":
-                    model = ARIMAForecast()
-                    model.fit(train_series)
-                elif self.model_type == "lstm":
-                    model = LSTMForecaster(**self.lstm_params)
-                    model.fit(train_series, verbose=0)
-                else:
-                    raise ValueError(f"Unknown model type: {self.model_type}")
-
-                self.cluster_models[cluster_id] = model
+        # Fit on each peer
+        self.peer_models = {}
+        if peer_series:
+            for ticker, peer_s in peer_series.items():
+                try:
+                    aligned = peer_s.loc[peer_s.index.isin(series.index)]
+                    if len(aligned) >= 252:
+                        peer_model = ARIMAForecast()
+                        peer_model.fit(aligned)
+                        self.peer_models[ticker] = peer_model
+                except Exception:
+                    continue
 
         return self
 
-    def predict(
-        self,
-        ticker: str,
-        cluster_label: int,
-        train_series: pd.Series,
-        horizon: int,
-    ) -> np.ndarray:
+    def predict(self, horizon: int) -> np.ndarray:
+        """Predict by weighted-averaging return-space forecasts from all models."""
+        if self.target_model is None or self.target_model.model_fit is None:
+            return np.full(horizon, np.nan)
+
+        # Collect return-space predictions
+        return_preds = []
+        weights = []
+
+        # Target stock's own forecast
+        try:
+            target_forecast = self.target_model.predict(horizon)
+            if not np.any(np.isnan(target_forecast)):
+                last_fitted = self.target_model.model_fit.data.endog[-1]
+                target_returns = target_forecast / last_fitted - 1
+                return_preds.append(target_returns)
+                weights.append(self.self_weight)
+        except (ValueError, AttributeError, RuntimeError):
+            pass
+
+        # Peer forecasts — collect successful predictions first, then assign equal weight
+        peer_return_preds = []
+        for ticker, model in self.peer_models.items():
+            try:
+                forecast = model.predict(horizon)
+                if np.any(np.isnan(forecast)):
+                    continue
+                last_fitted = model.model_fit.data.endog[-1]
+                peer_returns = forecast / last_fitted - 1
+                peer_return_preds.append(peer_returns)
+            except (ValueError, AttributeError, RuntimeError):
+                continue
+
+        # Distribute remaining weight equally among successful peers
+        n_successful_peers = len(peer_return_preds)
+        if n_successful_peers > 0:
+            peer_weight = (1 - self.self_weight) / n_successful_peers
+            for pr in peer_return_preds:
+                return_preds.append(pr)
+                weights.append(peer_weight)
+
+        if not return_preds:
+            return np.full(horizon, np.nan)
+
+        # Normalize weights and compute weighted average
+        weights = np.array(weights)
+        weights = weights / weights.sum()
+        avg_returns = np.average(return_preds, axis=0, weights=weights)
+
+        # Convert back to price level
+        return self.last_price * (1 + avg_returns)
+
+
+class ClusterConcatARIMA:
+    """
+    Concatenated Returns ARIMA: pools return series from all cluster
+    members into a single longer series, fits ARIMA on the pooled
+    returns, then maps predictions back to the target stock's price level.
+
+    By concatenating returns, the ARIMA model has more data points to
+    estimate autoregressive parameters, assuming cluster members share
+    a common return-generating process.
+    """
+
+    def __init__(self):
+        self.model = None
+        self.last_price = None
+        self.name = "Cluster-Concat-ARIMA"
+
+    def fit(self, series: pd.Series, peer_series: Optional[Dict[str, pd.Series]] = None):
         """
-        Predict for a specific ticker using its cluster's model.
+        Fit ARIMA on concatenated return series from all cluster members.
 
-        If the cluster model isn't available, falls back to fitting
-        a model on the individual stock's data.
+        Args:
+            series: Target stock's Close price series
+            peer_series: Dict of ticker -> Close price series for cluster peers
         """
-        if cluster_label in self.cluster_models:
-            model = self.cluster_models[cluster_label]
+        self.last_price = series.iloc[-1]
 
-            # Re-fit on the specific stock's data to get the right level
-            if self.model_type == "arima":
-                model = ARIMAForecast()
-                model.fit(train_series)
+        target_returns = series.pct_change().dropna()
 
-            return model.predict(horizon)
+        if peer_series and len(peer_series) > 0:
+            all_returns = [target_returns]
+            for ticker, peer_s in peer_series.items():
+                try:
+                    peer_returns = peer_s.pct_change().dropna()
+                    if len(peer_returns) >= 100:
+                        all_returns.append(peer_returns)
+                except Exception:
+                    continue
+
+            concat_returns = pd.concat(all_returns, ignore_index=True)
         else:
-            # Fallback: train individual model
-            if self.model_type == "arima":
-                model = ARIMAForecast()
-            else:
-                model = LSTMForecaster(**self.lstm_params)
+            concat_returns = target_returns.reset_index(drop=True)
 
-            model.fit(train_series)
-            return model.predict(horizon)
+        self.model = ARIMAForecast()
+        self.model.fit(concat_returns)
+        return self
+
+    def predict(self, horizon: int) -> np.ndarray:
+        """Predict returns, then convert to price level."""
+        if self.model is None or self.model.model_fit is None:
+            return np.full(horizon, np.nan)
+
+        try:
+            return_forecast = self.model.predict(horizon)
+            prices = [self.last_price]
+            for r in return_forecast:
+                prices.append(prices[-1] * (1 + r))
+            return np.array(prices[1:])
+        except Exception:
+            return np.full(horizon, np.nan)
+
+
+class ClusterARIMAWrapper:
+    """
+    Adapter that conforms to the standard fit(series)/predict(horizon)
+    interface for use with backtest_model(). Pre-configured with cluster
+    peer data at construction time.
+    """
+
+    def __init__(self, stock_data: Dict[str, pd.DataFrame],
+                 cluster_labels: pd.Series, target_ticker: str,
+                 method: str = "ensemble", self_weight: float = 0.5):
+        self.stock_data = stock_data
+        self.cluster_labels = cluster_labels
+        self.target_ticker = target_ticker
+        self.method = method
+        self.self_weight = self_weight
+        self.inner_model = None
+        self.name = f"Cluster-{method.capitalize()}-ARIMA"
+
+    def _get_peer_series(self, train_end_date) -> Dict[str, pd.Series]:
+        """Get peer price series truncated to the training period."""
+        cluster_id = self.cluster_labels.loc[self.target_ticker]
+        peers = self.cluster_labels[self.cluster_labels == cluster_id].index.tolist()
+        peers = [t for t in peers if t != self.target_ticker]
+
+        peer_series = {}
+        for ticker in peers:
+            if ticker in self.stock_data:
+                s = self.stock_data[ticker]["Close"]
+                peer_series[ticker] = s.loc[s.index <= train_end_date]
+        return peer_series
+
+    def fit(self, series: pd.Series):
+        """Standard fit interface — uses cluster peers internally."""
+        peer_series = self._get_peer_series(series.index[-1])
+
+        if self.method == "ensemble":
+            self.inner_model = ClusterEnsembleARIMA(self_weight=self.self_weight)
+        else:
+            self.inner_model = ClusterConcatARIMA()
+
+        self.inner_model.fit(series, peer_series)
+        self.name = self.inner_model.name
+        return self
+
+    def predict(self, horizon: int) -> np.ndarray:
+        return self.inner_model.predict(horizon)
 
 
 # =============================================================================

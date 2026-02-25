@@ -174,6 +174,61 @@ def backtest_model(
     return pd.DataFrame(results)
 
 
+def backtest_cluster_model(
+    series: pd.Series,
+    ticker: str,
+    stock_data: Dict[str, pd.DataFrame],
+    cluster_labels: pd.Series,
+    method: str = "ensemble",
+    self_weight: float = 0.5,
+    n_windows: int = WALK_FORWARD_WINDOWS,
+    horizons: Optional[Dict[str, int]] = None,
+) -> pd.DataFrame:
+    """
+    Backtest a cluster-informed model using walk-forward validation.
+
+    Constructs a ClusterARIMAWrapper for each walk-forward window with
+    proper date truncation to avoid data leakage from peer stocks.
+    """
+    from src.forecasters import ClusterARIMAWrapper
+
+    if ticker not in cluster_labels.index:
+        raise ValueError(f"Ticker '{ticker}' not found in cluster_labels index")
+
+    if horizons is None:
+        horizons = FORECAST_HORIZONS
+
+    splits = walk_forward_split(series, n_windows)
+    results = []
+
+    for window_idx, (train, test) in enumerate(splits):
+        model = ClusterARIMAWrapper(
+            stock_data=stock_data,
+            cluster_labels=cluster_labels,
+            target_ticker=ticker,
+            method=method,
+            self_weight=self_weight,
+        )
+        model.fit(train)
+
+        for horizon_name, horizon_steps in horizons.items():
+            actual_horizon = min(horizon_steps, len(test))
+            if actual_horizon == 0:
+                continue
+
+            predictions = model.predict(actual_horizon)
+            actual = test.values[:actual_horizon]
+
+            metrics = compute_all_metrics(actual, predictions)
+            metrics["Window"] = window_idx
+            metrics["Horizon"] = horizon_name
+            metrics["Model"] = model.name
+
+            results.append(metrics)
+
+    return pd.DataFrame(results)
+
+
 # =============================================================================
 # Model Comparison
 # =============================================================================
