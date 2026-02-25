@@ -27,7 +27,9 @@ def get_sp500_tickers() -> pd.DataFrame:
         DataFrame with columns: Symbol, Security, GICS Sector, GICS Sub-Industry
     """
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    tables = pd.read_html(url)
+    import requests as _req
+    _resp = _req.get(url, headers={"User-Agent": "Mozilla/5.0"})
+    tables = pd.read_html(_resp.text)
     sp500_table = tables[0]
 
     # Clean up ticker symbols (replace dots with dashes for yfinance)

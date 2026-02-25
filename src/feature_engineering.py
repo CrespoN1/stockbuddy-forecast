@@ -283,7 +283,7 @@ def create_feature_matrix(
             snapshot.name = ticker
 
             # Select only numeric features for the matrix
-            numeric_snapshot = snapshot.select_dtypes(include=[np.number])
+            numeric_snapshot = snapshot[snapshot.apply(lambda x: isinstance(x, (int, float, np.number)))]
             snapshots.append(numeric_snapshot)
 
         except Exception as e:
