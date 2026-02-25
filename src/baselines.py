@@ -142,6 +142,20 @@ class ARIMAForecast:
         except Exception:
             return np.full(horizon, np.nan)
 
+    def predict_with_ci(self, horizon: int, alpha: float = 0.05) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return (point_forecast, lower_ci, upper_ci) with confidence intervals."""
+        if self.model_fit is None:
+            nans = np.full(horizon, np.nan)
+            return nans, nans, nans
+
+        try:
+            fc = self.model_fit.get_forecast(steps=horizon)
+            ci = fc.conf_int(alpha=alpha)
+            return fc.predicted_mean.values, ci.iloc[:, 0].values, ci.iloc[:, 1].values
+        except Exception:
+            nans = np.full(horizon, np.nan)
+            return nans, nans, nans
+
 
 def run_all_baselines(
     train_series: pd.Series,
